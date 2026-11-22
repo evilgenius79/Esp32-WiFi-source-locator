@@ -31,7 +31,7 @@ enum {
   A_TAB = 0,
   A_FILTER = 10,
   A_CLEAR = 20, A_HUNT, A_MAP, A_STOP, A_CAL, A_MUTE, A_CH_DN, A_CH_UP,
-  A_N_DN, A_N_UP, A_AREA, A_UNDO, A_CLRPTS, A_EVEN, A_RESETCAL,
+  A_N_DN, A_N_UP, A_AREA, A_UNDO, A_CLRPTS, A_EVEN, A_RESETCAL, A_GPS,
   A_ANG_DN = 100,
   A_ANG_UP = 120,
   A_ROW = 1000,
@@ -116,6 +116,7 @@ App::App() {
   devs.reserve(MAX_DEVS);
   order.reserve(MAX_DEVS);
   survey.reserve(MAX_SURVEY);
+  surveyN.reserve(MAX_SURVEY);
 }
 
 static Dev* findDev(App& a, const uint8_t* mac) {
@@ -146,8 +147,8 @@ void nodePresence(App& a, int node, bool present, uint8_t chip, uint32_t now) {
     if (!a.anglesCustom) evenAngles(a);
   } else if (present && n.mx == 0 && n.my == 0) {
     const int k = node - WSL_MAX_WIRED;   // park new remote nodes near the corners
-    n.mx = a.mapSize * (0.12f + 0.76f * (k & 1) + 0.1f * (k >> 2));
-    n.my = a.mapSize * (0.12f + 0.76f * ((k >> 1) & 1));
+    n.mx = a.vx0 + a.vspan * (0.12f + 0.76f * (k & 1) + 0.1f * (k >> 2));
+    n.my = a.vy0 + a.vspan * (0.12f + 0.76f * ((k >> 1) & 1));
   }
 }
 
@@ -199,15 +200,175 @@ static void resetTrackState(App& a) {
   a.calRunning = false;
 }
 
+// ---------------------------------------------------------------- GPS + map readings
+
+bool gpsMode(const App& a) { return a.useGps && a.gps.present; }
+
+static void clearSurvey(App& a) {
+  a.survey.clear();
+  a.surveyN.clear();
+  a.binRadius = 1.5f;
+  a.spanBoost = 0;
+  a.mapRes = wsl::MapResult();
+  a.heatValid = false;
+  a.lastMapMs = 0;
+}
+
+void gpsStatus(App& a, bool present, const char* port) {
+  a.gps.present = present;
+  snprintf(a.gps.port, sizeof(a.gps.port), "%s", port ? port : "");
+  if (!present) {
+    a.gps.fix = false;
+    a.posValid = false;
+    a.headingValid = false;
+  }
+}
+
+void gpsUpdate(App& a, const wsl::GpsFix& f, uint32_t now) {
+  a.gps.quality = f.quality;
+  a.gps.sats = f.sats;
+  a.gps.hdop = f.hdop;
+  if (!f.valid) {
+    a.gps.fix = false;
+    return;
+  }
+  a.gps.lat = f.lat;
+  a.gps.lon = f.lon;
+  a.gps.lastFixMs = now;
+  a.gps.fix = true;
+
+  // Local metres are measured from an origin. Keep the remembered one while we
+  // are still at the same site, so remote nodes stay where they were put.
+  float x = 0, y = 0;
+  if (a.originSet) wsl::geoToLocal(f.lat, f.lon, a.lat0, a.lon0, x, y);
+  if (!a.originSet || fabsf(x) > 2000 || fabsf(y) > 2000) {
+    if (a.surveyGps) clearSurvey(a);
+    a.lat0 = f.lat;
+    a.lon0 = f.lon;
+    a.originSet = true;
+    a.prefsDirty = true;
+    x = y = 0;
+  }
+  a.posX = x;
+  a.posY = y;
+  a.posValid = true;
+  if (f.courseValid && f.speed >= 0.5f) {   // walking: direction of travel is meaningful
+    a.heading = f.course;
+    a.headingValid = true;
+    a.headingMs = now;
+  }
+}
+
+// When the reading list is full, average neighbours together over a wider radius.
+static void coarsenSurvey(App& a) {
+  a.binRadius *= 1.5f;
+  const float r2 = a.binRadius * a.binRadius;
+  for (size_t i = 0; i < a.survey.size(); i++) {
+    for (size_t j = i + 1; j < a.survey.size();) {
+      wsl::MapPoint &p = a.survey[i], &q = a.survey[j];
+      const float dx = p.x - q.x, dy = p.y - q.y;
+      if (dx * dx + dy * dy >= r2) {
+        j++;
+        continue;
+      }
+      const float np = a.surveyN[i], nq = a.surveyN[j], w = nq / (np + nq);
+      p.x += (q.x - p.x) * w;
+      p.y += (q.y - p.y) * w;
+      p.rssi += (q.rssi - p.rssi) * w;
+      a.surveyN[i] = (uint16_t)std::min(1000.0f, np + nq);
+      a.survey.erase(a.survey.begin() + j);
+      a.surveyN.erase(a.surveyN.begin() + j);
+    }
+  }
+}
+
+// GPS mode: fold the current signal strength into the reading for this spot.
+static void recordGpsReading(App& a) {
+  int best = -1;
+  float bestD = a.binRadius * a.binRadius;
+  for (size_t i = 0; i < a.survey.size(); i++) {
+    const float dx = a.survey[i].x - a.posX, dy = a.survey[i].y - a.posY, d = dx * dx + dy * dy;
+    if (d < bestD) {
+      bestD = d;
+      best = (int)i;
+    }
+  }
+  if (best >= 0) {
+    wsl::MapPoint& p = a.survey[best];
+    uint16_t& n = a.surveyN[best];
+    if (n < 100) n++;
+    const float w = 1.0f / n;
+    p.x += (a.posX - p.x) * w;
+    p.y += (a.posY - p.y) * w;
+    p.rssi += (a.headRssi - p.rssi) * w;
+    return;
+  }
+  if ((int)a.survey.size() >= MAX_SURVEY) coarsenSurvey(a);
+  if ((int)a.survey.size() >= MAX_SURVEY) return;
+  a.survey.push_back({a.posX, a.posY, a.headRssi});
+  a.surveyN.push_back(1);
+}
+
+// Decide which square of the world the map shows (and the solver searches).
+static void updateView(App& a) {
+  if (!a.surveyGps) {   // tap mode: a fixed area, the user's own frame
+    a.vx0 = a.vy0 = 0;
+    a.vspan = a.mapSize;
+    a.vnorth = false;
+    return;
+  }
+  float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
+  auto add = [&](float x, float y) {
+    x0 = std::min(x0, x); x1 = std::max(x1, x);
+    y0 = std::min(y0, y); y1 = std::max(y1, y);
+  };
+  for (auto& p : a.survey) add(p.x, p.y);
+  if (a.posValid) add(a.posX, a.posY);
+  for (int i = WSL_MAX_WIRED; i < WSL_MAX_NODES; i++)
+    if (a.nodes[i].present) add(a.nodes[i].mx, a.nodes[i].my);
+  if (x0 > x1) x0 = x1 = y0 = y1 = 0;
+  // Twice the walked extent, because the source is often outside the walk.
+  float want = (std::max(x1 - x0, y1 - y0) * 2.0f + 10.0f) * powf(1.5f, (float)a.spanBoost);
+  static const float NICE[] = {10, 20, 30, 50, 75, 100, 150, 200, 300, 500, 750, 1000, 1500, 2000, 3000, 5000};
+  float span = NICE[15];
+  for (float v : NICE)
+    if (v >= want) { span = v; break; }
+  const float snap = span / 20.0f;   // move the view in steps so it does not creep
+  const float cx = roundf((x0 + x1) * 0.5f / snap) * snap, cy = roundf((y0 + y1) * 0.5f / snap) * snap;
+  a.vx0 = cx - span * 0.5f;
+  a.vy0 = cy - span * 0.5f;
+  a.vspan = span;
+  a.vnorth = true;
+}
+
+static void solveMapNow(App& a, uint32_t now) {
+  updateView(a);
+  wsl::MapPoint pts[64];
+  int n = 0;
+  for (size_t i = 0; i < a.survey.size() && n < 64; i++)
+    if (!a.surveyGps || a.surveyN[i] >= 3) pts[n++] = a.survey[i];   // skip spots we only brushed past
+  for (int i = WSL_MAX_WIRED; i < WSL_MAX_NODES && n < 64; i++) {
+    const Node& nd = a.nodes[i];
+    if (nd.present && nd.filt.live(now)) pts[n++] = {nd.mx, nd.my, nd.filt.value + nd.cal};
+  }
+  a.mapRes = wsl::solveMap(pts, n, a.vx0, a.vy0, a.vspan, a.nExp, MAP_GRID, a.heat);
+  a.heatValid = a.mapRes.valid;
+  if (!a.surveyGps || !a.mapRes.valid) return;
+  // Estimate pinned to the edge: the source is probably further out, so widen
+  // the search next time. Comfortably central again: narrow it back.
+  const float u = (a.mapRes.x - a.vx0) / a.vspan, v = (a.mapRes.y - a.vy0) / a.vspan;
+  const float edge = std::min(std::min(u, 1 - u), std::min(v, 1 - v));
+  if (edge < 0.05f && a.spanBoost < 6) a.spanBoost++;
+  else if (edge > 0.3f && a.spanBoost > 0) a.spanBoost--;
+}
+
 void setTarget(App& a, const Dev& d) {
   a.hasTarget = true;
   memcpy(a.target, d.mac, 6);
   a.targetCh = d.channel >= 1 && d.channel <= 13 ? d.channel : 1;
   a.targetKind = d.kind;
   devName(d, a.targetName, sizeof(a.targetName));
-  a.survey.clear();
-  a.mapRes = wsl::MapResult();
-  a.heatValid = false;
+  clearSurvey(a);
   resetTrackState(a);
 }
 
@@ -294,6 +455,8 @@ void tick(App& a, uint32_t now) {
     a.lastSortMs = now;
     sortDevices(a, now);
   }
+  if (a.gps.fix && (int32_t)(now - a.gps.lastFixMs) > 3000) a.gps.fix = false;
+  if (a.headingValid && (int32_t)(now - a.headingMs) > 3000) a.headingValid = false;
   if (!a.hasTarget) return;
 
   // Handheld head: strongest calibrated antenna + bearing.
@@ -337,17 +500,20 @@ void tick(App& a, uint32_t now) {
     if (now - a.calStartMs >= CAL_MS) finishCal(a, now);
   }
 
-  if (a.screen == SCR_MAP && now - a.lastMapMs >= 500) {
+  // Map readings. Tapped and GPS readings live in different coordinate
+  // frames, so changing the position source starts a fresh set.
+  const bool gm = gpsMode(a);
+  if (!a.survey.empty() && a.surveyGps != gm) {
+    clearSurvey(a);
+    toast(a, now, "Position source changed - readings cleared");
+  }
+  if (a.survey.empty()) a.surveyGps = gm;
+  if (gm && tracking(a) && a.gps.fix && a.posValid && a.headLive) recordGpsReading(a);
+
+  const uint32_t every = a.survey.size() > 24 ? 1000 : 500;
+  if (a.screen == SCR_MAP && now - a.lastMapMs >= every) {
     a.lastMapMs = now;
-    wsl::MapPoint pts[64];
-    int n = 0;
-    for (auto& s : a.survey) pts[n++] = s;
-    for (int i = WSL_MAX_WIRED; i < WSL_MAX_NODES; i++) {
-      const Node& nd = a.nodes[i];
-      if (nd.present && nd.filt.live(now)) pts[n++] = {nd.mx, nd.my, nd.filt.value + nd.cal};
-    }
-    a.mapRes = wsl::solveMap(pts, n, 0, 0, a.mapSize, a.nExp, MAP_GRID, a.heat);
-    a.heatValid = a.mapRes.valid;
+    solveMapNow(a, now);
   }
 }
 
@@ -374,6 +540,14 @@ static void drawTopBar(App& a, LovyanGFX& g, uint32_t now) {
   if (remote) snprintf(buf, sizeof(buf), "%d wired + %d remote nodes", wired, remote);
   else snprintf(buf, sizeof(buf), "%d node%s", wired, wired == 1 ? "" : "s");
   txt(g, buf, SCREEN_W - 16, 44, F18, wired ? C_TEXT : C_BAD, textdatum_t::middle_right);
+  if (a.gps.present) {
+    const int x = SCREEN_W - 16 - g.textWidth(buf) - 28;
+    if (a.gps.fix)
+      txtf(g, x, 44, F18, a.gps.quality == 4 ? C_GOOD : C_TEXT, textdatum_t::middle_right, "GPS %s, %u sat",
+           wsl::gpsQualityName(a.gps.quality), a.gps.sats);
+    else
+      txt(g, "GPS no fix", x, 44, F18, C_WARN, textdatum_t::middle_right);
+  }
   (void)now;
 }
 
@@ -637,11 +811,20 @@ static void drawHunt(App& a, LovyanGFX& g, uint32_t now) {
         textdatum_t::bottom_center);
 }
 
-static int mapSX(const App& a, float x) { return MAP_X + (int)lroundf(x / a.mapSize * MAP_S); }
-static int mapSY(const App& a, float y) { return MAP_Y + (int)lroundf(y / a.mapSize * MAP_S); }
+static int mapSX(const App& a, float x) { return MAP_X + (int)lroundf((x - a.vx0) / a.vspan * MAP_S); }
+static int mapSY(const App& a, float y) {
+  const float t = (y - a.vy0) / a.vspan;
+  return MAP_Y + (int)lroundf((a.vnorth ? 1.0f - t : t) * MAP_S);
+}
+static void mapWorld(const App& a, int sx, int sy, float& x, float& y) {
+  const float u = clamp01((sx - MAP_X) / (float)MAP_S), v = clamp01((sy - MAP_Y) / (float)MAP_S);
+  x = a.vx0 + u * a.vspan;
+  y = a.vy0 + (a.vnorth ? 1.0f - v : v) * a.vspan;
+}
 
 static void drawMap(App& a, LovyanGFX& g, uint32_t now) {
   if (!a.hasTarget) return drawNoTarget(g);
+  const bool gps = a.surveyGps;
 
   g.fillRect(MAP_X, MAP_Y, MAP_S, MAP_S, C_PANEL);
   if (a.heatValid) {   // where the readings say the source probably is
@@ -649,7 +832,8 @@ static void drawMap(App& a, LovyanGFX& g, uint32_t now) {
     for (float v : a.heat) mn = std::min(mn, v);
     const float sigma2 = 2.0f * 4.0f * 4.0f;
     for (int j = 0; j < MAP_GRID; j++) {
-      const int y0 = MAP_Y + j * MAP_S / MAP_GRID, y1 = MAP_Y + (j + 1) * MAP_S / MAP_GRID;
+      const int r = a.vnorth ? MAP_GRID - 1 - j : j;   // north-up maps put row 0 at the bottom
+      const int y0 = MAP_Y + r * MAP_S / MAP_GRID, y1 = MAP_Y + (r + 1) * MAP_S / MAP_GRID;
       for (int i = 0; i < MAP_GRID; i++) {
         const float l = expf(-(a.heat[j * MAP_GRID + i] - mn) / sigma2);
         if (l < 0.04f) continue;
@@ -663,14 +847,19 @@ static void drawMap(App& a, LovyanGFX& g, uint32_t now) {
     g.drawFastHLine(MAP_X, MAP_Y + k * MAP_S / 4, MAP_S, C_LINE);
   }
   g.drawRect(MAP_X, MAP_Y, MAP_S, MAP_S, C_LINE);
-  txtf(g, MAP_X + 8, MAP_Y + MAP_S - 8, F18, C_DIM, textdatum_t::bottom_left, "%g m x %g m   grid %g m",
-       a.mapSize, a.mapSize, a.mapSize / 4);
+  txtf(g, MAP_X + 8, MAP_Y + MAP_S - 8, F18, C_DIM, textdatum_t::bottom_left, "%g m x %g m   grid %g m", a.vspan,
+       a.vspan, a.vspan / 4);
+  if (gps) {   // north arrow
+    g.fillTriangle(MAP_X + 24, MAP_Y + 10, MAP_X + 15, MAP_Y + 28, MAP_X + 33, MAP_Y + 28, C_DIM);
+    txt(g, "N", MAP_X + 24, MAP_Y + 32, F18, C_DIM, textdatum_t::top_center);
+  }
 
   g.setClipRect(MAP_X, MAP_Y, MAP_S, MAP_S);
-  for (auto& s : a.survey) {
+  for (size_t i = 0; i < a.survey.size(); i++) {
+    const wsl::MapPoint& s = a.survey[i];
     const int x = mapSX(a, s.x), y = mapSY(a, s.y);
-    g.fillCircle(x, y, 11, C_BG);
-    g.fillCircle(x, y, 8, heatColor(level(s.rssi)));
+    g.fillCircle(x, y, gps ? 8 : 11, C_BG);
+    g.fillCircle(x, y, gps ? 6 : 8, heatColor(level(s.rssi)));
   }
   for (int i = WSL_MAX_WIRED; i < WSL_MAX_NODES; i++) {
     const Node& n = a.nodes[i];
@@ -690,38 +879,87 @@ static void drawMap(App& a, LovyanGFX& g, uint32_t now) {
     quad(g, x, y - 40, x, y - 14, 1.5f, C_TEXT);
     quad(g, x, y + 14, x, y + 40, 1.5f, C_TEXT);
   }
+  if (gps && a.posValid) {   // you are here
+    const int x = mapSX(a, a.posX), y = mapSY(a, a.posY);
+    const uint32_t col = a.gps.fix ? C_ACCENT : C_DIM;
+    if (a.headingValid) {
+      // While walking we know which way the Tab5 is travelling, so the hunt
+      // arrow can be laid on the map (assuming it is held facing forward).
+      const float conf = sqrtf(a.bvx * a.bvx + a.bvy * a.bvy);
+      if (a.headLive && conf > 0.45f) {
+        const float b = wsl::deg2rad(a.heading + wsl::rad2deg(atan2f(a.bvx, a.bvy)));
+        quad(g, x + sinf(b) * 22, y - cosf(b) * 22, x + sinf(b) * 260, y - cosf(b) * 260, 1.5f, blend(C_PANEL, C_ACCENT, 0.7f));
+      }
+      const float h = wsl::deg2rad(a.heading), s = sinf(h), c = cosf(h);
+      g.fillCircle(x, y, 17, C_BG);
+      g.fillTriangle(x + s * 16, y - c * 16, x - s * 10 - c * 11, y + c * 10 - s * 11, x - s * 10 + c * 11,
+                     y + c * 10 + s * 11, col);
+    } else {
+      g.fillCircle(x, y, 13, C_BG);
+      g.fillCircle(x, y, 9, col);
+    }
+  }
   g.clearClipRect();
 
   // --- right panel
-  const int px = 664, pw = SCREEN_W - px - 16;
+  const int px = 664, pw = SCREEN_W - px - 16, px2 = px + pw / 2;
   drawTargetHeader(a, g, px, 80, pw);
 
   txt(g, "Signal where you are", px, 150, F18, C_DIM);
   if (a.headLive) txtf(g, px, 174, F40, heatColor(level(a.headRssi)), textdatum_t::top_left, "%d dBm",
                        (int)lroundf(a.headRssi));
   else txt(g, "no signal", px, 174, F40, C_DIM);
-
-  txt(g, "Estimated source", px + pw / 2, 150, F18, C_DIM);
-  int live = (int)a.survey.size();
-  for (int i = WSL_MAX_WIRED; i < WSL_MAX_NODES; i++) live += a.nodes[i].present && a.nodes[i].filt.live(now);
-  if (a.mapRes.valid) {
-    txtf(g, px + pw / 2, 174, F40, C_TEXT, textdatum_t::top_left, "%.1f, %.1f m", a.mapRes.x, a.mapRes.y);
-    const uint32_t c = a.mapRes.rmsDb < 4 ? C_GOOD : a.mapRes.rmsDb < 7 ? C_WARN : C_BAD;
-    txtf(g, px + pw / 2, 224, F18, c, textdatum_t::top_left, "%d readings, fit error %.1f dB", live, a.mapRes.rmsDb);
-  } else {
-    txtf(g, px + pw / 2, 180, F24, C_DIM, textdatum_t::top_left, "need 3 readings");
-    txtf(g, px + pw / 2, 224, F18, C_DIM, textdatum_t::top_left, "have %d", live);
+  if (gps) {
+    if (a.gps.fix)
+      txtf(g, px, 224, F18, a.gps.quality == 4 ? C_GOOD : C_TEXT, textdatum_t::top_left, "GPS: %s, %u satellites",
+           wsl::gpsQualityName(a.gps.quality), a.gps.sats);
+    else
+      txtf(g, px, 224, F18, C_WARN, textdatum_t::top_left, "GPS: no fix (%u satellites)", a.gps.sats);
   }
 
-  txt(g, "Walk around. At each stop, wait 2 s, then tap the map", px, 272, F18, C_DIM);
-  txt(g, "where you are standing. More spread-out stops = better.", px, 298, F18, C_DIM);
-  txt(g, "Drag remote nodes (R0, R1...) to where they really are.", px, 324, F18, C_DIM);
+  txt(g, "Estimated source", px2, 150, F18, C_DIM);
+  int used = 0;
+  for (size_t i = 0; i < a.survey.size(); i++) used += !gps || a.surveyN[i] >= 3;
+  for (int i = WSL_MAX_WIRED; i < WSL_MAX_NODES; i++) used += a.nodes[i].present && a.nodes[i].filt.live(now);
+  if (a.mapRes.valid) {
+    if (!gps) {
+      txtf(g, px2, 174, F40, C_TEXT, textdatum_t::top_left, "%.1f, %.1f m", a.mapRes.x, a.mapRes.y);
+    } else if (a.posValid) {
+      const float dx = a.mapRes.x - a.posX, dy = a.mapRes.y - a.posY, d = sqrtf(dx * dx + dy * dy);
+      txtf(g, px2, 174, F40, C_TEXT, textdatum_t::top_left, d < 10 ? "%.1f m %s" : "%.0f m %s", d,
+           wsl::compassName(wsl::rad2deg(atan2f(dx, dy))));
+    } else {
+      txt(g, "--", px2, 174, F40, C_DIM);
+    }
+    const uint32_t c = a.mapRes.rmsDb < 4 ? C_GOOD : a.mapRes.rmsDb < 7 ? C_WARN : C_BAD;
+    txtf(g, px2, 224, F18, c, textdatum_t::top_left, "%d readings, fit error %.1f dB", used, a.mapRes.rmsDb);
+    if (gps && a.originSet) {
+      double lat, lon;
+      wsl::localToGeo(a.mapRes.x, a.mapRes.y, a.lat0, a.lon0, lat, lon);
+      txtf(g, px2, 250, F18, C_TEXT, textdatum_t::top_left, "%.7f, %.7f", lat, lon);
+    }
+  } else {
+    txt(g, "need 3 readings", px2, 180, F24, C_DIM);
+    txtf(g, px2, 224, F18, C_DIM, textdatum_t::top_left, "have %d", used);
+  }
+
+  if (!gps) {
+    txt(g, "Walk around. At each stop, wait 2 s, then tap the map", px, 284, F18, C_DIM);
+    txt(g, "where you are standing. More spread-out stops = better.", px, 310, F18, C_DIM);
+  } else if (a.gps.fix) {
+    txt(g, "Just walk: readings are recorded where GPS says you are.", px, 284, F18, C_DIM);
+    txt(g, "Cover two directions (an L or a loop), not one straight line.", px, 310, F18, C_DIM);
+  } else {
+    txt(g, "Waiting for a GPS fix. The antenna needs open sky.", px, 284, F18, C_WARN);
+    txt(g, "Indoors? Switch Position to taps (bottom left).", px, 310, F18, C_DIM);
+  }
+  txt(g, "Drag remote nodes (R0, R1...) to where they really are.", px, 336, F18, C_DIM);
 
   int col = 0;
   for (int i = WSL_MAX_WIRED; i < WSL_MAX_NODES; i++) {
     const Node& n = a.nodes[i];
     if (!n.present) continue;
-    const int x = px + (col % 4) * (pw / 4), y = 368 + (col / 4) * 30;
+    const int x = px + (col % 4) * (pw / 4), y = 376 + (col / 4) * 30;
     if (n.filt.live(now))
       txtf(g, x, y, F18, C_TEXT, textdatum_t::top_left, "R%d  %d dBm", i - WSL_MAX_WIRED,
            (int)lroundf(n.filt.value + n.cal));
@@ -737,15 +975,35 @@ static void drawMap(App& a, LovyanGFX& g, uint32_t now) {
   button(a, g, px + pw - 84, 448, 84, 64, "+", A_N_UP);
 
   const int bw = (pw - 2 * 12) / 3;
-  char area[24];
-  snprintf(area, sizeof(area), "Area %g m", a.mapSize);
-  button(a, g, px, 540, bw, 64, area, A_AREA);
+  if (gps) {
+    txt(g, "Auto zoom", px + bw / 2, 572, F24, C_DIM, textdatum_t::middle_center);
+  } else {
+    char area[24];
+    snprintf(area, sizeof(area), "Area %g m", a.mapSize);
+    button(a, g, px, 540, bw, 64, area, A_AREA);
+  }
   button(a, g, px + bw + 12, 540, bw, 64, "Undo", A_UNDO);
   button(a, g, px + 2 * (bw + 12), 540, bw, 64, "Clear", A_CLRPTS);
-  button(a, g, px, 632, pw, 64, "Stop", A_STOP);
+  if (a.gps.present) {   // only offer the choice when there is a GPS to choose
+    const int hw = (pw - 12) / 2;
+    button(a, g, px, 632, hw, 64, a.useGps ? "Position: GPS" : "Position: taps", A_GPS, a.useGps);
+    button(a, g, px + hw + 12, 632, hw, 64, "Stop", A_STOP);
+  } else {
+    button(a, g, px, 632, pw, 64, "Stop", A_STOP);
+  }
 }
 
 static void drawNodes(App& a, LovyanGFX& g, uint32_t now) {
+  // GPS receiver status (useful when wiring one up).
+  if (!a.gps.present)
+    txtf(g, 24, 566, F18, C_DIM, textdatum_t::top_left, "GPS   %s", a.gps.port[0] ? a.gps.port : "not found");
+  else if (!a.gps.fix)
+    txtf(g, 24, 566, F18, C_WARN, textdatum_t::top_left, "GPS   on %s   no fix yet, %u satellites", a.gps.port,
+         a.gps.sats);
+  else
+    txtf(g, 24, 566, F18, C_TEXT, textdatum_t::top_left, "GPS   on %s   %s, %u satellites, HDOP %.1f   %.7f, %.7f",
+         a.gps.port, wsl::gpsQualityName(a.gps.quality), a.gps.sats, a.gps.hdop, a.gps.lat, a.gps.lon);
+
   int count = 0;
   for (auto& n : a.nodes) count += n.present;
   if (!count) {
@@ -839,6 +1097,7 @@ static void act(App& a, int id, uint32_t now) {
   if (id >= A_TAB && id < A_TAB + 4) {
     const bool was = tracking(a);
     a.screen = (Screen)(id - A_TAB);
+    a.lastMapMs = 0;
     if (tracking(a) != was) resetTrackState(a);
     return;
   }
@@ -909,12 +1168,21 @@ static void act(App& a, int id, uint32_t now) {
       break;
     }
     case A_UNDO:
-      if (!a.survey.empty()) a.survey.pop_back();
+      if (!a.survey.empty()) {
+        a.survey.pop_back();
+        a.surveyN.pop_back();
+      }
       a.lastMapMs = 0;
       break;
     case A_CLRPTS:
-      a.survey.clear();
-      a.lastMapMs = 0;
+      clearSurvey(a);
+      break;
+    case A_GPS:
+      a.useGps = !a.useGps;
+      clearSurvey(a);
+      a.surveyGps = gpsMode(a);
+      a.prefsDirty = true;
+      toast(a, now, a.useGps ? "Positions from GPS" : "Positions from taps");
       break;
     case A_EVEN:
       a.anglesCustom = false;
@@ -957,8 +1225,7 @@ void touch(App& a, bool pressed, int x, int y, uint32_t now) {
     if (abs(x - a.tx0) + abs(y - a.ty0) > 18) a.tMoved = true;
     if (a.tDragNode >= 0 && a.tMoved) {
       Node& n = a.nodes[a.tDragNode];
-      n.mx = clamp01((x - MAP_X) / (float)MAP_S) * a.mapSize;
-      n.my = clamp01((y - MAP_Y) / (float)MAP_S) * a.mapSize;
+      mapWorld(a, x, y, n.mx, n.my);
       a.lastMapMs = 0;
     } else if (a.tOnList && a.tMoved) {
       a.scrollY = a.tScroll0 - (y - a.ty0);
@@ -978,11 +1245,14 @@ void touch(App& a, bool pressed, int x, int y, uint32_t now) {
       }
     }
     if (a.screen == SCR_MAP && a.hasTarget && inMap(a.tx0, a.ty0)) {
-      if (!a.headLive) toast(a, now, "No signal here - reading not added");
+      if (a.surveyGps) toast(a, now, "GPS mode: readings are added as you walk");
+      else if (!a.headLive) toast(a, now, "No signal here - reading not added");
       else if ((int)a.survey.size() >= MAX_SURVEY) toast(a, now, "Reading limit reached - clear some");
       else {
-        a.survey.push_back({(a.tx0 - MAP_X) / (float)MAP_S * a.mapSize, (a.ty0 - MAP_Y) / (float)MAP_S * a.mapSize,
-                            a.headRssi});
+        float wx, wy;
+        mapWorld(a, a.tx0, a.ty0, wx, wy);
+        a.survey.push_back({wx, wy, a.headRssi});
+        a.surveyN.push_back(100);
         a.lastMapMs = 0;
         toast(a, now, "Reading added");
       }

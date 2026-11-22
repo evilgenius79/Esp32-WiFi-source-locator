@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <string>
 
 #include "../src/app.h"
 
@@ -27,6 +28,7 @@ static void shot(app::App& a, uint32_t now, const char* name) {
 }
 
 static void tap(app::App& a, int x, int y, uint32_t now) {
+  app::draw(a, canvas, now);   // buttons exist once they have been drawn
   app::touch(a, true, x, y, now);
   app::touch(a, false, x, y, now);
 }
@@ -125,5 +127,80 @@ int main(int argc, char** argv) {
   printf("map estimate %.1f, %.1f (true %.0f, %.0f) rms %.1f dB\n", a.mapRes.x, a.mapRes.y, sx, sy, a.mapRes.rmsDb);
   snprintf(name, sizeof(name), "%s/4_map", out);
   shot(a, now, name);
-  return 0;
+
+  // GPS: walk an L-shaped path past a source, fed as real NMEA text at 5 Hz.
+  int rc = 0;
+  {
+    app::App b;
+    uint32_t t = 1000;
+    for (int i = 0; i < 4; i++) app::nodePresence(b, i, true, WSL_CHIP_C3, t);
+    app::gpsStatus(b, true, "G38 @ 115200");
+    WslDevEntry e = {};
+    const uint8_t mac[6] = {0x3C, 0x71, 0xBF, 0x10, 0x20, 0x30};
+    memcpy(e.mac, mac, 6);
+    e.channel = 11;
+    e.kind = WSL_KIND_AP | WSL_KIND_HAS_SSID;
+    e.rssi = -60;
+    app::mergeDevice(b, 0, e, t);
+    app::setSsid(b, mac, "Workshop", 8);
+    t += 2000;
+    app::tick(b, t);
+    tap(b, 400, 136 + 20, t);                 // select it
+    tap(b, 1280 - 248 + 50, 720 - 60, t);     // Map
+
+    const double lat0 = 47.6205, lon0 = -122.3493;
+    const float srcX = 28, srcY = 24;         // metres east / north of the start
+    wsl::NmeaParser parser;
+    auto sentence = [](const char* body) {
+      uint8_t sum = 0;
+      for (const char* p = body; *p; p++) sum ^= (uint8_t)*p;
+      char out[200];
+      snprintf(out, sizeof(out), "$%s*%02X\r\n", body, sum);
+      return std::string(out);
+    };
+    float x = 0, y = 0;
+    for (int step = 0; step < 5 * 62; step++) {   // 62 s at 1.3 m/s: 45 m east, then 35 m north
+      t += 200;
+      const bool east = x < 45;
+      (east ? x : y) += 1.3f * 0.2f;
+      double lat, lon;
+      wsl::localToGeo(x + 0.02f * noise(rng), y + 0.02f * noise(rng), lat0, lon0, lat, lon);
+      char body[160];
+      const double alat = fabs(lat), alon = fabs(lon);
+      snprintf(body, sizeof(body), "GNGGA,120000.00,%02d%010.7f,%c,%03d%010.7f,%c,4,26,0.6,56.0,M,-18.0,M,1.0,0000",
+               (int)alat, (alat - (int)alat) * 60, lat >= 0 ? 'N' : 'S', (int)alon, (alon - (int)alon) * 60,
+               lon >= 0 ? 'E' : 'W');
+      std::string text = sentence(body);
+      snprintf(body, sizeof(body), "GNRMC,120000.00,A,%02d%010.7f,%c,%03d%010.7f,%c,2.53,%05.1f,221126,,,R",
+               (int)alat, (alat - (int)alat) * 60, lat >= 0 ? 'N' : 'S', (int)alon, (alon - (int)alon) * 60,
+               lon >= 0 ? 'E' : 'W', east ? 90.0 : 0.0);
+      text += sentence(body);
+      for (char c : text)
+        if (parser.feed(c) != wsl::NmeaParser::NONE) app::gpsUpdate(b, parser.fix, t);
+
+      for (int half = 0; half < 2; half++) {
+        const uint32_t tt = t + half * 100;
+        const float d = fmaxf(0.5f, hypotf(x - srcX, y - srcY));
+        const float base = -36 - 30 * log10f(d) + 2.5f * noise(rng);
+        // Antennas face travel direction (0), right, back, left; source bearing relative to travel.
+        const float rel = wsl::rad2deg(atan2f(srcX - x, srcY - y)) - (east ? 90.0f : 0.0f);
+        for (int n = 0; n < 4; n++)
+          app::feedTrack(b, n, 3, 3 * (int)lroundf(base + antennaDb(wsl::angleDiff(rel, b.nodes[n].angle))), tt);
+        app::tick(b, tt);
+      }
+    }
+    const float err = hypotf(b.mapRes.x - srcX, b.mapRes.y - srcY);
+    printf("gps map: %d spots, estimate %.1f, %.1f (true %.0f, %.0f), error %.1f m, view %g m\n", (int)b.survey.size(),
+           b.mapRes.x, b.mapRes.y, srcX, srcY, err, b.vspan);
+    if (!b.mapRes.valid || err > 8 || !b.surveyGps || !b.gps.fix) {
+      printf("FAIL: GPS mapping did not locate the source\n");
+      rc = 1;
+    }
+    snprintf(name, sizeof(name), "%s/6_map_gps", out);
+    shot(b, t, name);
+    tap(b, 8 + 3 * 168 + 80, 30, t);   // Nodes tab shows the receiver status
+    snprintf(name, sizeof(name), "%s/7_nodes_gps", out);
+    shot(b, t, name);
+  }
+  return rc;
 }

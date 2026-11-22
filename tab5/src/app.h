@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "wsl_locate.h"
+#include "wsl_nmea.h"
 #include "wsl_proto.h"
 
 namespace app {
@@ -17,7 +18,7 @@ constexpr int SCREEN_W = 1280, SCREEN_H = 720;
 constexpr int MAP_GRID = 40;
 constexpr int HIST_N = 240;          // 60 s at 4 Hz
 constexpr int MAX_DEVS = 300;
-constexpr int MAX_SURVEY = 48;
+constexpr int MAX_SURVEY = 56;       // + 8 remote nodes = the solver's 64-point limit
 constexpr uint32_t CAL_MS = 12000;
 
 enum Screen : uint8_t { SCR_SCAN, SCR_HUNT, SCR_MAP, SCR_NODES };
@@ -45,6 +46,16 @@ struct Dev {
   uint32_t seenMs[WSL_MAX_WIRED];
   int8_t best = -128;
   uint32_t lastMs = 0;
+};
+
+struct Gps {
+  bool present = false;      // a receiver is talking to us
+  bool fix = false;          // ...and has a current position
+  uint8_t quality = 0, sats = 0;
+  float hdop = 99;
+  double lat = 0, lon = 0;
+  uint32_t lastFixMs = 0;
+  char port[24] = {0};       // e.g. "G38 @ 115200", or what the search is doing
 };
 
 struct Btn {
@@ -88,10 +99,27 @@ struct App {
   uint32_t calN[WSL_MAX_WIRED] = {0};
   uint32_t calTicks = 0;
 
+  // GPS (optional)
+  Gps gps;
+  bool useGps = true;            // take map positions from GPS rather than taps
+  bool originSet = false;
+  double lat0 = 0, lon0 = 0;     // where local (0, 0) is
+  bool posValid = false;
+  float posX = 0, posY = 0;      // where we are: metres east / north of the origin
+  bool headingValid = false;
+  float heading = 0;             // direction of travel, degrees true
+  uint32_t headingMs = 0;
+
   // Map
-  float mapSize = 20.0f;         // metres across
+  float mapSize = 20.0f;         // metres across (tap mode)
   float nExp = 3.0f;             // path-loss exponent
   std::vector<wsl::MapPoint> survey;
+  std::vector<uint16_t> surveyN; // how many samples were averaged into each reading
+  bool surveyGps = false;        // readings are GPS-positioned (north up) rather than tapped
+  float binRadius = 1.5f;        // GPS readings closer than this are averaged together
+  int spanBoost = 0;
+  float vx0 = 0, vy0 = 0, vspan = 20.0f;   // world square shown on the map = solver search area
+  bool vnorth = false;
   wsl::MapResult mapRes;
   float heat[MAP_GRID * MAP_GRID];
   bool heatValid = false;
@@ -114,10 +142,13 @@ void mergeDevice(App& a, int node, const WslDevEntry& e, uint32_t now);
 void setSsid(App& a, const uint8_t* mac, const char* ssid, int len);
 void feedTrack(App& a, int node, uint32_t count, int32_t sum, uint32_t now);
 void nodePresence(App& a, int node, bool present, uint8_t chip, uint32_t now);
+void gpsStatus(App& a, bool present, const char* port);         // receiver found / lost / being searched for
+void gpsUpdate(App& a, const wsl::GpsFix& f, uint32_t now);      // after each position sentence
 
 // --- logic
 void tick(App& a, uint32_t now);
 bool tracking(const App& a);                       // nodes should lock onto the target
+bool gpsMode(const App& a);                        // map readings come from GPS
 void desiredMode(const App& a, bool relay, WslModeArgs& out);
 void setTarget(App& a, const Dev& d);
 int beepIntervalMs(const App& a, int* freqOut);    // 0 = silent

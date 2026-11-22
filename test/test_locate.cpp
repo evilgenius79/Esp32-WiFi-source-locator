@@ -4,11 +4,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <string>
 
 #include <vector>
 
 #include "wsl_frame.h"
 #include "wsl_locate.h"
+#include "wsl_nmea.h"
 #include "wsl_proto.h"
 
 static int failures = 0;
@@ -237,8 +239,92 @@ static void testFrames() {
   CHECK(!wsl_parse_frame(f.data(), 10, fi), "runt rejected");
 }
 
+// Wrap an NMEA body in $...*HH\r\n with the right checksum.
+static std::string nmea(const std::string& body) {
+  uint8_t sum = 0;
+  for (char c : body) sum ^= (uint8_t)c;
+  char tail[8];
+  snprintf(tail, sizeof(tail), "*%02X\r\n", sum);
+  return "$" + body + tail;
+}
+
+static int feedAll(wsl::NmeaParser& p, const std::string& text) {
+  int best = 0;
+  for (char c : text) best = std::max(best, (int)p.feed(c));
+  return best;
+}
+
+static void testNmea() {
+  wsl::NmeaParser p;
+
+  // RTK-fixed GGA from a multi-constellation receiver, with centimetre-level digits.
+  CHECK(feedAll(p, nmea("GNGGA,123519.00,4807.0380123,N,01131.0004567,E,4,24,0.6,545.4,M,46.9,M,1.0,0000")) ==
+            wsl::NmeaParser::POSITION, "GGA gives a position");
+  CHECK(p.fix.valid && p.fix.quality == 4 && p.fix.sats == 24, "q=%u sats=%u", p.fix.quality, p.fix.sats);
+  CHECK(fabs(p.fix.lat - (48.0 + 7.0380123 / 60.0)) < 1e-9, "lat %.9f", p.fix.lat);
+  CHECK(fabs(p.fix.lon - (11.0 + 31.0004567 / 60.0)) < 1e-9, "lon %.9f", p.fix.lon);
+  CHECK(fabsf(p.fix.hdop - 0.6f) < 1e-4f && fabsf(p.fix.alt - 545.4f) < 1e-3f, "hdop/alt");
+  CHECK(!strcmp(wsl::gpsQualityName(p.fix.quality), "RTK fixed"), "quality name");
+
+  // RMC adds speed and course but must not replace the better GGA position.
+  CHECK(feedAll(p, nmea("GNRMC,123520.00,A,4807.0000,N,01131.0000,E,2.72,084.4,230394,,,A")) ==
+            wsl::NmeaParser::SENTENCE, "RMC parsed");
+  CHECK(fabsf(p.fix.speed - 2.72f * 0.514444f) < 1e-3f && p.fix.courseValid && fabsf(p.fix.course - 84.4f) < 1e-3f,
+        "speed %.2f course %.1f", p.fix.speed, p.fix.course);
+  CHECK(fabs(p.fix.lat - (48.0 + 7.0380123 / 60.0)) < 1e-9, "RMC left the GGA position alone");
+
+  // Southern / western hemisphere.
+  feedAll(p, nmea("GPGGA,010203,3351.2340,S,15112.5670,W,1,08,1.1,12.0,M,0.0,M,,"));
+  CHECK(p.fix.lat < 0 && p.fix.lon < 0 && fabs(p.fix.lat + (33.0 + 51.234 / 60.0)) < 1e-9, "S/W negative");
+
+  // No fix: empty fields, quality 0.
+  CHECK(feedAll(p, nmea("GNGGA,010204.00,,,,,0,00,99.99,,,,,,")) == wsl::NmeaParser::SENTENCE, "no-fix GGA parses");
+  CHECK(!p.fix.valid && p.fix.quality == 0, "no fix reported");
+
+  // Corruption and noise are ignored.
+  const uint32_t good = p.good;
+  std::string bad = nmea("GNGGA,123519.00,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,");
+  bad[20] = '9';
+  CHECK(feedAll(p, bad) == wsl::NmeaParser::NONE && p.good == good && p.bad == 1, "bad checksum rejected");
+  CHECK(feedAll(p, "\xB5\x62\x01\x07garbage\r\n$GNGGA,no,checksum\r\n" + std::string(300, 'x')) ==
+            wsl::NmeaParser::NONE, "binary and junk ignored");
+  CHECK(!p.fix.valid, "junk did not create a fix");
+  CHECK(feedAll(p, nmea("GPGSV,3,1,11,03,03,111,00,04,15,270,00,06,01,010,00,13,06,292,00")) ==
+            wsl::NmeaParser::SENTENCE, "other sentences count as traffic");
+
+  // A receiver that only sends RMC still yields positions.
+  wsl::NmeaParser r;
+  CHECK(feedAll(r, nmea("GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W")) ==
+            wsl::NmeaParser::POSITION, "RMC-only position");
+  CHECK(r.fix.valid && fabs(r.fix.lat - 48.1173) < 1e-6, "lat %.6f", r.fix.lat);
+  feedAll(r, nmea("GPRMC,123520,V,,,,,,,230394,,"));
+  CHECK(!r.fix.valid, "RMC void clears the fix");
+}
+
+static void testGeo() {
+  const double lat0 = 47.6205, lon0 = -122.3493;
+  float x, y;
+  wsl::geoToLocal(lat0 + 0.001, lon0, lat0, lon0, x, y);
+  CHECK(fabsf(y - 111.195f) < 0.05f && fabsf(x) < 1e-3f, "0.001 deg of latitude = %.3f m", y);
+  wsl::geoToLocal(lat0, lon0 + 0.001, lat0, lon0, x, y);
+  CHECK(fabsf(x - 111.195f * cosf(47.6205f * 3.14159265f / 180)) < 0.05f, "longitude shrinks with latitude: %.3f", x);
+  // There and back again stays within a centimetre.
+  for (float px : {-350.0f, 12.34f, 480.0f}) {
+    for (float py : {-420.0f, 0.01f, 275.5f}) {
+      double la, lo;
+      wsl::localToGeo(px, py, lat0, lon0, la, lo);
+      wsl::geoToLocal(la, lo, lat0, lon0, x, y);
+      CHECK(fabsf(x - px) < 0.01f && fabsf(y - py) < 0.01f, "round trip %.3f,%.3f -> %.3f,%.3f", px, py, x, y);
+    }
+  }
+  CHECK(!strcmp(wsl::compassName(0), "N") && !strcmp(wsl::compassName(44), "NE") && !strcmp(wsl::compassName(-90), "W") &&
+            !strcmp(wsl::compassName(359), "N") && !strcmp(wsl::compassName(180), "S"), "compass names");
+}
+
 int main() {
   testFrames();
+  testNmea();
+  testGeo();
   testBearing();
   testSpinCal();
   testFilter();

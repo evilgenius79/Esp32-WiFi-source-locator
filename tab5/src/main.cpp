@@ -1,11 +1,12 @@
 // WiFi Source Locator - M5Stack Tab5 firmware.
 //
 // Polls the XIAO sensor nodes over I2C on Port A (Grove: SDA=G53, SCL=G54),
-// feeds the readings to the app and draws the UI. All the interesting logic
-// lives in app.cpp and ../common/wsl_locate.h.
+// reads an optional GPS receiver, feeds both to the app and draws the UI. All
+// the interesting logic lives in app.cpp and ../common.
 #include <M5Unified.h>
 #include <Preferences.h>
 #include <Wire.h>
+#include <driver/gpio.h>
 
 #include "app.h"
 
@@ -140,15 +141,183 @@ static void pollScan(uint32_t now) {
   }
 }
 
+// ---------------------------------------------------------------- GPS receiver
+//
+// Any receiver that sends NMEA (GGA, ideally RMC too) on a 3.3 V serial line
+// works: wire its TX to one of the header pins below and share ground. Only
+// that one wire is used; nothing is ever sent to the receiver. The pin and
+// baud rate are found automatically and remembered. To pin them down instead,
+// build with e.g.  -DGPS_RX_PIN=38 -DGPS_BAUD=115200
+
+#ifndef GPS_RX_PIN
+#define GPS_RX_PIN -1
+#endif
+#ifndef GPS_BAUD
+#define GPS_BAUD 0
+#endif
+
+// The Tab5's free M5-Bus GPIOs (taken from M5Unified's pin table).
+static const uint8_t GPS_PINS[] = {38, 7, 16, 17, 6, 37, 3, 4, 2, 48, 47, 35, 51, 45, 52, 18, 19, 5};
+static const uint32_t GPS_BAUDS[] = {115200, 38400, 9600, 460800, 230400, 57600, 921600};
+static constexpr int GPS_NPINS = sizeof(GPS_PINS), GPS_NBAUDS = sizeof(GPS_BAUDS) / sizeof(GPS_BAUDS[0]);
+
+struct EdgeCount {
+  uint8_t pin;
+  volatile uint16_t count;
+};
+static EdgeCount gpsEdges[GPS_NPINS];
+
+static void IRAM_ATTR onGpsEdge(void* arg) {
+  EdgeCount* e = (EdgeCount*)arg;
+  const uint16_t c = e->count + 1;
+  e->count = c;
+  if (c >= 400) gpio_intr_disable((gpio_num_t)e->pin);   // plenty: stop interrupting
+}
+
+enum GpsState : uint8_t { GPS_SAVED, GPS_LISTEN, GPS_PROBE, GPS_RUN, GPS_WAIT };
+static GpsState gpsState = GPS_SAVED;
+static wsl::NmeaParser nmea;
+static uint32_t gpsT0 = 0, gpsLastGood = 0, gpsBaud = 0;
+static int gpsPin = -1;
+static uint8_t gpsActive[GPS_NPINS];   // pins with traffic, to be probed
+static int gpsActiveN = 0, gpsPinIdx = 0, gpsBaudIdx = 0;
+
+static void gpsOpen(int pin, uint32_t baud, uint32_t now) {
+  Serial1.end();
+  Serial1.setRxBufferSize(4096);
+  Serial1.begin(baud, SERIAL_8N1, pin, -1);
+  nmea.reset();
+  gpsPin = pin;
+  gpsBaud = baud;
+  gpsT0 = now;
+}
+
+// Returns the parser's verdicts for everything received since the last call.
+static int gpsPump(uint32_t now) {
+  int best = wsl::NmeaParser::NONE;
+  for (int budget = 4096; budget > 0 && Serial1.available(); budget--) {
+    const int r = nmea.feed((char)Serial1.read());
+    if (r == wsl::NmeaParser::NONE) continue;
+    gpsLastGood = now;
+    if (r > best) best = r;
+    if (gpsState == GPS_RUN) app::gpsUpdate(A, nmea.fix, now);
+  }
+  return best;
+}
+
+static void gpsFound(uint32_t now) {
+  char port[24];
+  snprintf(port, sizeof(port), "G%d @ %lu", gpsPin, (unsigned long)gpsBaud);
+  app::gpsStatus(A, true, port);
+  gpsState = GPS_RUN;
+  gpsLastGood = now;
+  if (prefs.getChar("gpsPin", -1) != gpsPin || prefs.getUInt("gpsBaud", 0) != gpsBaud) {
+    prefs.putChar("gpsPin", (int8_t)gpsPin);
+    prefs.putUInt("gpsBaud", gpsBaud);
+  }
+}
+
+static void gpsStartProbe(uint32_t now) {
+  const uint32_t baud = GPS_BAUD ? (uint32_t)GPS_BAUD : GPS_BAUDS[gpsBaudIdx];
+  gpsOpen(gpsActive[gpsPinIdx], baud, now);
+  gpsState = GPS_PROBE;
+  char msg[24];
+  snprintf(msg, sizeof(msg), "trying G%d @ %lu", gpsPin, (unsigned long)baud);
+  app::gpsStatus(A, false, msg);
+}
+
+// Watch every candidate pin for a moment: a receiver's TX line is the one that wiggles.
+static void gpsStartListen(uint32_t now) {
+  Serial1.end();
+  gpsBaudIdx = 0;
+  gpsPinIdx = 0;
+  if (GPS_RX_PIN >= 0) {   // pin fixed at build time: nothing to look for
+    gpsActive[0] = (uint8_t)GPS_RX_PIN;
+    gpsActiveN = 1;
+    gpsStartProbe(now);
+    return;
+  }
+  for (int i = 0; i < GPS_NPINS; i++) {
+    gpsEdges[i].pin = GPS_PINS[i];
+    gpsEdges[i].count = 0;
+    pinMode(GPS_PINS[i], INPUT_PULLUP);
+    attachInterruptArg(GPS_PINS[i], onGpsEdge, &gpsEdges[i], FALLING);
+  }
+  gpsState = GPS_LISTEN;
+  gpsT0 = now;
+  app::gpsStatus(A, false, "searching...");
+}
+
+static void gpsLoop(uint32_t now) {
+  switch (gpsState) {
+    case GPS_SAVED: {   // first thing after boot: is it where it was last time?
+      if (gpsT0 == 0) {
+        const int pin = GPS_RX_PIN >= 0 ? GPS_RX_PIN : prefs.getChar("gpsPin", -1);
+        const uint32_t baud = GPS_BAUD ? (uint32_t)GPS_BAUD : prefs.getUInt("gpsBaud", 0);
+        if (pin < 0 || !baud) return gpsStartListen(now);
+        gpsOpen(pin, baud, now ? now : 1);
+        app::gpsStatus(A, false, "starting...");
+      }
+      gpsPump(now);
+      if (nmea.good >= 2) gpsFound(now);
+      else if (now - gpsT0 > 2500) gpsStartListen(now);
+      break;
+    }
+    case GPS_LISTEN: {
+      if (now - gpsT0 < 1500) break;
+      gpsActiveN = 0;
+      for (int i = 0; i < GPS_NPINS; i++) {
+        detachInterrupt(GPS_PINS[i]);
+        pinMode(GPS_PINS[i], INPUT);
+        if (gpsEdges[i].count >= 20) gpsActive[gpsActiveN++] = GPS_PINS[i];
+      }
+      if (!gpsActiveN) {
+        app::gpsStatus(A, false, "not found");
+        gpsState = GPS_WAIT;
+        gpsT0 = now;
+      } else {
+        gpsStartProbe(now);
+      }
+      break;
+    }
+    case GPS_PROBE: {
+      gpsPump(now);
+      if (nmea.good >= 2) return gpsFound(now);
+      if (now - gpsT0 < 1500) break;
+      if (!GPS_BAUD && ++gpsBaudIdx < GPS_NBAUDS) return gpsStartProbe(now);   // next speed
+      gpsBaudIdx = 0;
+      if (++gpsPinIdx < gpsActiveN) return gpsStartProbe(now);                 // next pin
+      Serial1.end();
+      char msg[24];
+      snprintf(msg, sizeof(msg), "G%d: no NMEA", gpsPin);   // something talks there, but not in NMEA
+      app::gpsStatus(A, false, msg);
+      gpsState = GPS_WAIT;
+      gpsT0 = now;
+      break;
+    }
+    case GPS_RUN:
+      gpsPump(now);
+      if (now - gpsLastGood > 8000) {   // unplugged or switched off
+        app::gpsStatus(A, false, "lost");
+        gpsStartListen(now);
+      }
+      break;
+    case GPS_WAIT:   // look again every so often, so a receiver can be plugged in later
+      if (now - gpsT0 > 8000) gpsStartListen(now);
+      break;
+  }
+}
+
 // ---------------------------------------------------------------- settings
 
 struct Saved {
   uint32_t magic;
   float cal[WSL_MAX_NODES], angle[WSL_MAX_NODES], mx[WSL_MAX_NODES], my[WSL_MAX_NODES];
   float nExp, mapSize;
-  uint8_t mute, anglesCustom;
+  uint8_t mute, anglesCustom, useGps, originSet;
+  double lat0, lon0;
 };
-static constexpr uint32_t SAVED_MAGIC = 0x57534C31;   // "WSL1"
+static constexpr uint32_t SAVED_MAGIC = 0x57534C32;   // "WSL2"
 
 static void loadPrefs() {
   Saved s;
@@ -163,6 +332,10 @@ static void loadPrefs() {
   A.mapSize = s.mapSize;
   A.mute = s.mute;
   A.anglesCustom = s.anglesCustom;
+  A.useGps = s.useGps;
+  A.originSet = s.originSet;
+  A.lat0 = s.lat0;
+  A.lon0 = s.lon0;
 }
 
 static void savePrefs() {
@@ -178,6 +351,10 @@ static void savePrefs() {
   s.mapSize = A.mapSize;
   s.mute = A.mute;
   s.anglesCustom = A.anglesCustom;
+  s.useGps = A.useGps;
+  s.originSet = A.originSet;
+  s.lat0 = A.lat0;
+  s.lon0 = A.lon0;
   prefs.putBytes("cfg", &s, sizeof(s));
 }
 
@@ -229,6 +406,7 @@ void loop() {
   }
 
   now = millis();
+  gpsLoop(now);
   const auto t = M5.Touch.getDetail();
   app::touch(A, M5.Touch.getCount() > 0 && t.isPressed(), t.x, t.y, now);
   app::tick(A, now);
