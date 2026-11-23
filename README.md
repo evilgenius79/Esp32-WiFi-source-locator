@@ -46,7 +46,7 @@ It is 2.4 GHz only (none of the C3, S3 or C6 has a 5 GHz radio).
 | Qty | Part | Notes |
 | --- | --- | --- |
 | 1 | M5Stack Tab5 | |
-| 4 | XIAO ESP32-C3, -S3 or -C6 | Any mix. 3 is the minimum, up to 8 are supported. 4 is the sweet spot: about 8 degrees of bearing error in simulation, against about 14 with 3. |
+| 4-6 | XIAO ESP32-C3, -S3 or -C6 | Any mix. 3 is the minimum, up to 8 are supported. 4 suits wide-beam antennas (patches); 6 suits narrow-beam ones (Yagis). See [Antennas](#antennas). |
 | 4 | 2.4 GHz directional antennas with U.FL plugs | See [Antennas](#antennas). This is what makes direction finding work. |
 | 1 | Grove hub or a hand-made 4-wire harness | All nodes share the same four wires. |
 | 0-8 | Extra XIAOs + USB power banks | Optional remote nodes for Map mode. |
@@ -59,6 +59,17 @@ others. With the bare stock antennas there is almost no difference between nodes
 and the arrow will stay grey ("No clear direction").
 
 - **Easiest:** small 2.4 GHz patch or panel antennas, one per node, facing outwards.
+- **PCB Yagi antennas** (the long boards with a row of stripes) work well but have
+  a narrower beam, so four of them leave weak spots between the beams. In
+  simulation with a noisy signal, four Yagis lying flat averaged about 22 degrees
+  of bearing error (38 in the gaps), against about 10 for six. Two things help:
+  - Mount the boards **on edge**, like fins, with the stripes vertical. The beam
+    is wider that way round, and it matches the vertical antennas most routers
+    use. Four on edge averaged about 13 to 15 degrees.
+  - Use **six**, 60 degrees apart.
+
+  Point the end with the short stripes outwards (the connector end is the back)
+  and keep that end clear of the Tab5 and of your hands.
 - **Cheapest:** keep the stock stick-on antennas and build a cross-shaped
   divider from cardboard covered in aluminium or copper foil, so each antenna
   sits in its own metal-backed corner, about 3 cm from the foil.
