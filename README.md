@@ -81,6 +81,13 @@ edge when held in landscape), right, back and left. Node 0 is forward and the
 ids go clockwise seen from above. Other layouts work too: set each node's
 direction on the Nodes tab.
 
+### Holder
+
+A 3D-printable holder for the antennas, XIAOs, Tab5 and GPS antenna is in
+[`hardware/`](hardware/README.md), with print files and assembly steps.
+
+![Printable holder](docs/holder.png)
+
 ### Wiring
 
 All wired nodes connect in parallel to the Tab5's **Port A** (the red Grove socket):
@@ -238,6 +245,7 @@ them from a separate 5 V supply with the grounds joined.
 | `node/` | XIAO firmware: packet sniffer, I2C slave, ESP-NOW relay / remote node |
 | `tab5/` | Tab5 firmware: `main.cpp` (hardware), `app.cpp` (logic and screens) |
 | `tab5/sim/` | PC preview that renders the screens to image files |
+| `hardware/` | 3D-printable holder: OpenSCAD model, STL files, assembly notes |
 | `common/` | Shared code: wire protocol, 802.11 frame parser, NMEA parser, locating math |
 | `test/` | Unit tests that run on a PC |
 
